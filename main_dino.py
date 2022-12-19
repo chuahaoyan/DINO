@@ -32,7 +32,7 @@ from torchvision import models as torchvision_models
 
 import utils
 import vision_transformer as vits
-from vision_transformer import DINOHead
+from vision_transformer import CCT, DINOHead
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -128,7 +128,6 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
-
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
@@ -142,12 +141,14 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    #dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    dataset = datasets.STL10(root="./data", transform=transform, download=True)
+    #print(dataset.shape)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
+        batch_size=2,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
@@ -158,26 +159,23 @@ def train_dino(args):
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
-    if args.arch in vits.__dict__.keys():
-        student = vits.__dict__[args.arch](
-            patch_size=args.patch_size,
-            drop_path_rate=args.drop_path_rate,  # stochastic depth
-        )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
-        embed_dim = student.embed_dim
+
+    student =  vits.vit_tiny()
+    teacher =  vits.vit_tiny()
+    embed_dim = student.embedding_dim*4
     # if the network is a XCiT
-    elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
-        student = torch.hub.load('facebookresearch/xcit:main', args.arch,
-                                 pretrained=False, drop_path_rate=args.drop_path_rate)
-        teacher = torch.hub.load('facebookresearch/xcit:main', args.arch, pretrained=False)
-        embed_dim = student.embed_dim
+    # elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
+    #     student = torch.hub.load('facebookresearch/xcit:main', args.arch,
+    #                              pretrained=False, drop_path_rate=args.drop_path_rate)
+    #     teacher = torch.hub.load('facebookresearch/xcit:main', args.arch, pretrained=False)
+    #     embed_dim = student.embedding_dim
     # otherwise, we check if the architecture is in torchvision models
-    elif args.arch in torchvision_models.__dict__.keys():
-        student = torchvision_models.__dict__[args.arch]()
-        teacher = torchvision_models.__dict__[args.arch]()
-        embed_dim = student.fc.weight.shape[1]
-    else:
-        print(f"Unknow architecture: {args.arch}")
+    # elif args.arch in torchvision_models.__dict__.keys():
+    #     student = torchvision_models.__dict__[args.arch]()
+    #     teacher = torchvision_models.__dict__[args.arch]()
+    #     embed_dim = student.fc.weight.shape[1]
+    # else:
+    #     print(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(student, DINOHead(
@@ -253,15 +251,15 @@ def train_dino(args):
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        student=student,
-        teacher=teacher,
-        optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
-        dino_loss=dino_loss,
-    )
+    # utils.restart_from_checkpoint(
+    #     os.path.join(args.output_dir, "checkpoint.pth"),
+    #     run_variables=to_restore,
+    #     student=student,
+    #     teacher=teacher,
+    #     optimizer=optimizer,
+    #     fp16_scaler=fp16_scaler,
+    #     dino_loss=dino_loss,
+    # )
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
@@ -317,6 +315,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_output = student(images)
+            if torch.any(student_output.isnan()) or torch.any(teacher_output.isnan()):
+                print("nan value")
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
@@ -325,11 +325,11 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # student update
         optimizer.zero_grad()
-        param_norms = None
+        #param_norms = None
         if fp16_scaler is None:
             loss.backward()
             if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)
+                torch.nn.utils.clip_grad_norm(student.parameters(), args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
@@ -337,7 +337,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             fp16_scaler.scale(loss).backward()
             if args.clip_grad:
                 fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(student, args.clip_grad)
+                torch.nn.utils.clip_grad_norm(student.parameters(), args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
@@ -433,14 +433,14 @@ class DataAugmentationDINO(object):
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(96, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(96, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
